@@ -1,0 +1,2 @@
+# qcosignal
+Qt bound coroutines
