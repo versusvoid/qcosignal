@@ -175,6 +175,24 @@ struct Async
 };
 
 /*
+ * await controller returned from final_suspend()
+ * if there is upstack coroutine, it will be indicated for resumption
+ */
+struct Continuation
+{
+    CoroutineControllerBase<> *up;
+
+    bool await_ready() const noexcept
+    {
+        return !up;
+    }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<>) noexcept;
+
+    void await_resume() noexcept {}
+};
+
+/*
  * main piece of code, controlling behavior of coroutines
  * (hence the name, because C++'s own "promise_type" is oh so unambiguous)
  *
@@ -276,28 +294,25 @@ struct CoroutineControllerBase
     inline Async<T> get_return_object() noexcept { return Async<T>(m_state); }
 
     inline static std::suspend_never initial_suspend() noexcept { return {}; }
-    inline static std::suspend_never final_suspend() noexcept { return {}; }
 
-    void handle_return() noexcept
+    inline Continuation final_suspend() noexcept
     {
         QObject::disconnect(m_connection);
         m_state->current = nullptr;
 
-        if (!m_state->up) {
-            return;
+        /*
+         * if there is another coroutine, awaiting on `this` — it will be awoken
+         * after this one was destroyed
+         */
+        Continuation next = { m_state->up };
+
+        if (m_state->up) {
+            Q_ASSERT(reinterpret_cast<CoroutineControllerBase*>(m_state->up->m_state->down) == this);
+            m_state->up->m_state->down = nullptr;
+            m_state->up = nullptr;
         }
 
-        /*
-         * if there is another coroutine, awaiting on `this` — awake it
-         * (via event loop, so that `this` can be gracefully destroyed)
-         */
-        Q_ASSERT(reinterpret_cast<CoroutineControllerBase*>(m_state->up->m_state->down) == this);
-        m_state->up->m_state->down = nullptr;
-
-        auto handle = m_state->up->make_handle();
-        QTimer::singleShot(0, [=] { handle.resume(); });
-
-        m_state->up = nullptr;
+        return next;
     }
 
     inline static void unhandled_exception() noexcept
@@ -345,13 +360,11 @@ struct CoroutineController : CoroutineControllerBase<T>
     inline void return_value(T&& v) noexcept
     {
         this->m_state->result.emplace(std::forward<T>(v));
-        this->handle_return();
     }
 
     inline void return_value(T& v) noexcept
     {
         this->m_state->result.emplace(v);
-        this->handle_return();
     }
 };
 
@@ -369,7 +382,6 @@ struct CoroutineController<void> : CoroutineControllerBase<void>
     inline void return_void() noexcept
     {
         m_state->result.emplace(true);
-        handle_return();
     }
 };
 
@@ -402,6 +414,15 @@ void Async<T>::await_suspend(std::coroutine_handle<> untypedHandle)
     // linking couroutines with each other
     m_state->up = up;
     up->m_state->down = m_state->current;
+}
+
+inline std::coroutine_handle<> Continuation::await_suspend(std::coroutine_handle<>) noexcept
+{
+    if (up) {
+        return up->make_handle();
+    }
+
+    return std::noop_coroutine();
 }
 
 /*
